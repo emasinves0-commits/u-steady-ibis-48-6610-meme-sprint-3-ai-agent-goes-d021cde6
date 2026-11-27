@@ -1616,6 +1616,47 @@ def verify_written_file(path):
     return problems
 
 
+def blob_integrity_report():
+    """Per-chunk CRC report for the embedded PNG, without writing it.
+
+    decode_entry_png() already fails loudly on a bad chunk, but it
+    says nothing when everything is fine. This reports the table a
+    human wants to see: every chunk's type, length, and CRC verdict,
+    plus the IDAT payload total — proof the blob survived the bundle
+    intact, chunk by chunk, instead of a single silent pass.
+    """
+    raw = base64.b64decode(ENTRY_PNG_B64)
+    rows = []
+    cursor = 8
+    idat_total = 0
+    while cursor < len(raw):
+        (length,) = struct.unpack(">I", raw[cursor:cursor + 4])
+        kind = raw[cursor + 4:cursor + 8]
+        stored = struct.unpack(
+            ">I", raw[cursor + 8 + length:cursor + 12 + length]
+        )[0]
+        actual = zlib.crc32(kind + raw[cursor + 8:cursor + 8 + length])
+        actual &= 0xFFFFFFFF
+        rows.append(
+            {
+                "chunk": kind.decode("ascii", "replace"),
+                "length": length,
+                "crc": "OK" if stored == actual else "MISMATCH",
+            }
+        )
+        if kind == b"IDAT":
+            idat_total += length
+        cursor += 12 + length
+        if kind == b"IEND":
+            break
+    return {
+        "total_bytes": len(raw),
+        "chunks": rows,
+        "idat_bytes": idat_total,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
 def self_test():
     """Verify the embedded entry end to end; exit non-zero on failure."""
     import tempfile
@@ -1655,9 +1696,15 @@ def main(argv):
 
         print(json.dumps(entry_fingerprint(), indent=2))
         return 0
+    if "--integrity" in argv:
+        import json
+
+        print(json.dumps(blob_integrity_report(), indent=2))
+        return 0
     if "--help" in argv or "-h" in argv:
         print(
-            "usage: main.py [--self-test] [--describe] [--help]\n"
+            "usage: main.py [--self-test] [--describe] [--integrity]"
+            " [--help]\n"
             "Writes entry.png (1024x1024, 83800 bytes) to"
             " $MAKEFUN_OUTPUT_DIR."
         )
