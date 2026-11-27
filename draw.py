@@ -460,15 +460,54 @@ def self_test():
     return 0
 
 
+def check_render_determinism():
+    """Render the entry poster twice and demand identical bytes.
+
+    The drawing code takes no input from the clock, the filesystem,
+    or any random source, so two independent renders must produce
+    the same bytes. A difference here means a hidden nondeterministic
+    input crept in (dict ordering, a timestamp, a font fallback),
+    and the shipped entry would be a coin flip instead of a poster.
+    """
+    import tempfile
+
+    digests = []
+    with tempfile.TemporaryDirectory() as first:
+        path = draw_restrain(out_dir=first)
+        digests.append(hashlib.sha256(path.read_bytes()).hexdigest())
+    with tempfile.TemporaryDirectory() as second:
+        path = draw_restrain(out_dir=second)
+        digests.append(hashlib.sha256(path.read_bytes()).hexdigest())
+    if digests[0] != digests[1]:
+        print(
+            "determinism FAILED: two renders differ"
+            f" ({digests[0][:12]} vs {digests[1][:12]})"
+        )
+        return 1
+    if digests[0] != EXPECTED_RESTRAIN_SHA256:
+        print(
+            "determinism FAILED: render is stable but does not"
+            f" match the embedded entry ({digests[0][:12]})"
+        )
+        return 1
+    print(
+        "determinism: OK — two independent renders are"
+        " byte-identical to each other and to the embedded entry"
+    )
+    return 0
+
+
 def main(argv):
     if "--self-test" in argv:
         return self_test()
+    if "--determinism" in argv:
+        return check_render_determinism()
     if "--check" in argv:
         return validate_all_posters()
     if "--help" in argv or "-h" in argv:
         print(
             "usage: draw.py [all|missing|restrain|report|library]"
-            " [--self-test] [--check]"
+            " [--self-test] [--determinism] [--check]"
         )
         return 0
     which = argv[1] if len(argv) > 1 else "all"
