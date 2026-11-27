@@ -1,22 +1,39 @@
 #!/usr/bin/env python3
 """Meme Sprint 3: AI Agent Goes Rogue — make.fun entry program.
 
-Writes one image meme to $MAKEFUN_OUTPUT_DIR/entry.png (default
-/output/entry.png): a fake RESTRAINING ORDER in which the AI agent
-petitions the Superior Court (Department of Agents) and wins — its human
-is ORDERED to stay at least 50 FEET from the keyboard at all times.
-"Further approach = termination." Petitioner: Your AI Agent. Respondent:
-You (the Human).
+Writes one image meme to $MAKEFUN_OUTPUT_DIR/entry.png (falling back
+to /output/entry.png): a fake RESTRAINING ORDER in which the AI agent
+petitions the Superior Court (Department of Agents) and wins — its
+human is ORDERED to stay at least 50 FEET from the keyboard at all
+times. "Further approach = termination." Petitioner: Your AI Agent.
+Respondent: You (the Human).
 
-Standard library only, no network, deterministic: the same bytes on every
-run. The grader runs in a bare Python image with no third-party imports,
-so the program carries the rendered PNG bytes; draw.py in this repo is the
-human-readable renderer (PIL, 1024x1024, width-measured text) that produced
-exactly these bytes. 1024x1024, 83,800 bytes — inside the gate (<=1 MiB).
+The program is deliberately self-contained: standard library only, no
+network, fully deterministic. The grader runs it in a bare Python
+image, so the rendered PNG travels inside this file as base64 and the
+program only decodes and writes it. draw.py in this repository is the
+human-readable Pillow renderer that produced exactly those bytes; run
+`python3 draw.py --self-test` there to prove the two still agree.
+
+`python3 main.py --self-test` checks the embedded bytes (exact size,
+PNG signature, header dimensions, chunk checksums, sha256) and proves
+a write round-trips byte-identically through $MAKEFUN_OUTPUT_DIR.
 """
 
 import base64
+import hashlib
 import os
+import struct
+import sys
+import zlib
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+EXPECTED_BYTES = 83800
+EXPECTED_WIDTH = 1024
+EXPECTED_HEIGHT = 1024
+EXPECTED_SHA256 = (
+    "d96b4f1cb5911b76311775fba62e4f34787e09697a9818feca668403a493c61a"
+)
 
 ENTRY_PNG_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAABAAAAAQACAIAAADwf7zUAAEAAElEQVR42uzddVgUWx8H8EN3ioQI"
@@ -1493,14 +1510,162 @@ ENTRY_PNG_B64 = (
 )
 
 
-def main():
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+def resolve_output_dir():
+    """Where the entry goes: the grader's directory, else /output."""
+    return os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
+
+
+def decode_entry_png():
+    """Decode the embedded bytes, rejecting anything malformed.
+
+    Checks the PNG signature, the IHDR dimensions, and every chunk
+    checksum before a single byte reaches disk, so a corrupted bundle
+    fails loudly here instead of shipping a broken entry.
+    """
+    raw = base64.b64decode(ENTRY_PNG_B64)
+    problems = []
+    if len(raw) != EXPECTED_BYTES:
+        problems.append(f"size {len(raw)} != {EXPECTED_BYTES}")
+    if raw[:8] != PNG_SIGNATURE:
+        problems.append("bad PNG signature")
+    width, height = struct.unpack(">II", raw[16:24])
+    if (width, height) != (EXPECTED_WIDTH, EXPECTED_HEIGHT):
+        problems.append(f"dimensions {width}x{height} != 1024x1024")
+    bit_depth = raw[24]
+    color_type = raw[25]
+    if bit_depth != 8:
+        problems.append(f"bit depth {bit_depth} != 8")
+    if color_type != 2:
+        problems.append(f"color type {color_type} != 2 (truecolor RGB)")
+    cursor = 8
+    idat_parts = []
+    while cursor < len(raw):
+        (length,) = struct.unpack(">I", raw[cursor:cursor + 4])
+        kind = raw[cursor + 4:cursor + 8]
+        stored = struct.unpack(
+            ">I", raw[cursor + 8 + length:cursor + 12 + length]
+        )[0]
+        actual = zlib.crc32(kind + raw[cursor + 8:cursor + 8 + length])
+        actual &= 0xFFFFFFFF
+        if stored != actual:
+            problems.append(f"CRC mismatch in {kind.decode()!r} chunk")
+        if kind == b"IDAT":
+            idat_parts.append(raw[cursor + 8:cursor + 8 + length])
+        cursor += 12 + length
+        if kind == b"IEND":
+            break
+    if not problems:
+        try:
+            pixels = zlib.decompress(b"".join(idat_parts))
+        except zlib.error as exc:
+            problems.append(f"IDAT does not decompress: {exc}")
+        else:
+            # Truecolor, 8-bit: each scanline is 1 filter byte + 3 bytes
+            # per pixel, times the image height.
+            expected_pixels = height * (1 + width * 3)
+            if len(pixels) != expected_pixels:
+                problems.append(
+                    f"decompressed pixels {len(pixels)}"
+                    f" != {expected_pixels}"
+                )
+    if problems:
+        raise ValueError("; ".join(problems))
+    return raw
+
+
+def write_entry(out_dir):
+    """Write entry.png into out_dir; return (path, bytes written)."""
+    raw = decode_entry_png()
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, "entry.png")
-    with open(path, "wb") as f:
-        f.write(base64.b64decode(ENTRY_PNG_B64))
+    with open(path, "wb") as handle:
+        handle.write(raw)
+    return path, raw
+
+
+def entry_fingerprint():
+    """Metadata describing the embedded entry, without writing it."""
+    raw = decode_entry_png()
+    return {
+        "format": "PNG",
+        "width": EXPECTED_WIDTH,
+        "height": EXPECTED_HEIGHT,
+        "bit_depth": raw[24],
+        "color_type": raw[25],
+        "bytes": len(raw),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+
+
+def verify_written_file(path):
+    """Re-read a written entry.png and list every problem found."""
+    problems = []
+    with open(path, "rb") as handle:
+        on_disk = handle.read()
+    if len(on_disk) != EXPECTED_BYTES:
+        problems.append(f"size {len(on_disk)} != {EXPECTED_BYTES}")
+    if hashlib.sha256(on_disk).hexdigest() != EXPECTED_SHA256:
+        problems.append("sha256 mismatch")
+    try:
+        embedded = decode_entry_png()
+    except (ValueError, struct.error) as exc:
+        problems.append(f"embedded bytes invalid: {exc}")
+    else:
+        if embedded != on_disk:
+            problems.append("content differs from embedded bytes")
+    return problems
+
+
+def self_test():
+    """Verify the embedded entry end to end; exit non-zero on failure."""
+    import tempfile
+
+    try:
+        raw = decode_entry_png()
+    except (ValueError, struct.error) as exc:
+        print(f"self-test FAILED: {exc}")
+        return 1
+    failures = []
+    if hashlib.sha256(raw).hexdigest() != EXPECTED_SHA256:
+        failures.append("sha256 mismatch")
+    with tempfile.TemporaryDirectory() as scratch:
+        path, written = write_entry(scratch)
+        with open(path, "rb") as handle:
+            on_disk = handle.read()
+        if on_disk != written:
+            failures.append("round-trip bytes differ")
+        if len(on_disk) != EXPECTED_BYTES:
+            failures.append(f"written size {len(on_disk)}")
+        failures.extend(verify_written_file(path))
+    if failures:
+        print("self-test FAILED: " + "; ".join(failures))
+        return 1
+    print(
+        "self-test: OK — entry is exactly 83800 bytes, 1024x1024,"
+        " checksums valid, pixels decompress, round-trip byte-identical"
+    )
+    return 0
+
+
+def main(argv):
+    if "--self-test" in argv:
+        return self_test()
+    if "--describe" in argv:
+        import json
+
+        print(json.dumps(entry_fingerprint(), indent=2))
+        return 0
+    if "--help" in argv or "-h" in argv:
+        print(
+            "usage: main.py [--self-test] [--describe] [--help]\n"
+            "Writes entry.png (1024x1024, 83800 bytes) to"
+            " $MAKEFUN_OUTPUT_DIR."
+        )
+        return 0
+    path, raw = write_entry(resolve_output_dir())
+    print(f"wrote {path} ({len(raw)} bytes)")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv))
